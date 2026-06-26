@@ -88,9 +88,14 @@ from src.problem_trafos.trafo_resolver import get_prior_trafo
 # Default paths
 # ===========================================================================
 BRATS_VAL_LMDB = Path("/scratch/10471/peterwg/brats2021_lmdb/brats_val_60x60x39_4x_singlecoil_lmdb")
-EMA_CKPT       = Path("/scratch/10471/peterwg/brats_runs/bs4/ema_model_26.pt")
-TRAIN_CFG      = Path("/scratch/10471/peterwg/brats_runs/bs4/outputs/brats/train_dense/"
-                      "2026-06-04T20:18:40.347833Z_bs_4/.hydra/config.yaml")
+# Latest BraTS diffusion model: 3axis_downsample (target_scaling_factor=2.0, RMS-1 kspacenorm —
+# matches the kspace_vol_norm normalization in brats_vol_to_csgm_2d). Use the HIGHEST-index ema
+# (ema_model_75.pt = final epoch; the old ema_model_25.pt is 50 epochs stale). The previous bs4
+# model (ema_model_26.pt, target_scaling_factor=5050 + raw-k-space-norm) is superseded.
+EMA_CKPT       = Path("/scratch/10471/peterwg/clean_brats_diff_models/outputs/3axis_downsample/"
+                      "2026-06-10T02:32:42.599607Z/ema_model_75.pt")
+TRAIN_CFG      = Path("/scratch/10471/peterwg/clean_brats_diff_models/outputs/3axis_downsample/"
+                      "2026-06-10T02:32:42.599607Z/.hydra/config.yaml")
 
 
 # ===========================================================================
@@ -104,9 +109,14 @@ def _ifft(x):
 
 
 def _fft(x):
-    x = torch_fft.fftshift(x, dim=(-2, -1))
-    x = torch_fft.fft2(x, dim=(-2, -1), norm="ortho")
+    # Centered fft2c: ifftshift -> fft2 -> fftshift. Must mirror _ifft so the pair is a
+    # true forward/adjoint on ALL sizes. The upstream csgm order (fftshift->fft2->ifftshift)
+    # is only correct for even N; on odd axes (e.g. BraTS Z=39) it is NOT the inverse of
+    # _ifft and lands DC at ceil(N/2) instead of floor(N/2)=shape//2, mis-registering the
+    # centered Gaussian mask and corrupting the data-consistency gradient along that axis.
     x = torch_fft.ifftshift(x, dim=(-2, -1))
+    x = torch_fft.fft2(x, dim=(-2, -1), norm="ortho")
+    x = torch_fft.fftshift(x, dim=(-2, -1))
     return x
 
 
@@ -185,6 +195,14 @@ def kno_ssim(rec_hw2, gt_hw2):
     return _meddlr_metrics.ssim(rec_mag, gt_mag).mean()
 
 
+def kno_nmse(rec_hw2, gt_hw2):
+    """rec, gt: (H, W, 2). NMSE = ||rec_mag - gt_mag||^2 / ||gt_mag||^2 — same
+    formula as reconstruct_modified.py's _vol_nmse (canonical, fastmri convention)."""
+    rec_mag = _to_mag(rec_hw2).float()
+    gt_mag  = _to_mag(gt_hw2).float()
+    return (rec_mag - gt_mag).pow(2).sum() / gt_mag.pow(2).sum()
+
+
 # ===========================================================================
 # Score model loader — same as reconstruct_csgm_kno.py.
 # ===========================================================================
@@ -244,7 +262,11 @@ class LangevinOptimizer(torch.nn.Module):
             abar = sde._compute_alpha_cumprod(
                 torch.tensor(self.timesteps, device=device)).squeeze()
             self.sigmas = (1.0 - abar).sqrt().detach()
-        self.sigma_L = float(self.sigmas[0].item())
+        # FIX (per reconstruct_csgm_kno.py "critical bug, now fixed"): divide by
+        # sigmas[-1] (SMALLEST sigma, t≈0) not sigmas[0] (largest) — gives step
+        # sizes LARGE at high noise / step_lr at lowest noise (correct annealed
+        # Langevin behavior; sigmas[0] made steps ~8000x too small at high noise).
+        self.sigma_min = float(self.sigmas[-1].item())
 
     @torch.no_grad()
     def _predict_eps(self, samples_b2hw, t_idx):
@@ -286,7 +308,7 @@ class LangevinOptimizer(torch.nn.Module):
         with torch.no_grad():
             for k, t_idx in enumerate(pbar):
                 sigma        = float(self.sigmas[k].item())
-                step_size    = step_lr * (sigma / self.sigma_L) ** 2
+                step_size    = step_lr * (sigma / self.sigma_min) ** 2
                 n_steps_each = int(self.config["n_steps_each"])
 
                 for _ in range(n_steps_each):
@@ -323,6 +345,36 @@ class LangevinOptimizer(torch.nn.Module):
 
     def sample(self, y):
         return self._sample(y)
+
+
+# ===========================================================================
+# LangevinOptimizerStrided — "multi_step" sampler (n_jumps uniformly-spaced
+# DDPM timesteps). Faithful port of reconstruct_csgm_kno.py's subclass: the
+# ONLY override is __init__ (replaces the dense [t_start..0] timestep list with
+# n_jumps uniformly spaced timesteps and recomputes sigmas/sigma_min). _sample/
+# _predict_eps/sample are inherited UNCHANGED, so all BraTS-specific behavior
+# (2D mask orientation='2d', prior_input_scale Fix 3, MVUE via _ifft, metrics)
+# carries over automatically.
+# ===========================================================================
+class LangevinOptimizerStrided(LangevinOptimizer):
+    def __init__(self, config, device, score, sde, prior_trafo, scaling_factor,
+                 prior_input_scale=1.0):
+        super().__init__(config, device, score, sde, prior_trafo, scaling_factor,
+                         prior_input_scale=prior_input_scale)
+        n_jumps = int(config["n_jumps"])
+        t_max   = self.timesteps[0]
+        strided = sorted(
+            set(int(round(t)) for t in np.linspace(t_max, 0, n_jumps)),
+            reverse=True,
+        )
+        self.timesteps = strided
+        with torch.no_grad():
+            abar = sde._compute_alpha_cumprod(
+                torch.tensor(self.timesteps, device=device)).squeeze()
+            if abar.dim() == 0:
+                abar = abar.unsqueeze(0)
+            self.sigmas = (1.0 - abar).sqrt().detach()
+        self.sigma_min = float(self.sigmas[-1].item())
 
 
 # ===========================================================================
@@ -399,17 +451,28 @@ def brats_vol_to_csgm_2d(lmdb_path, vol_idx, device, readout_axis=0):
     # near-zero amplitude from 1D-IFFT approach, giving sf ≈ 1.7e9 (catastrophic).
     target_c  = torch.complex(target_t, torch.zeros_like(target_t))
     coil_imgs = target_c.unsqueeze(0) * maps_t    # (C,H,W) complex  [broadcast target]
-    ksp_2d_t  = _fft(coil_imgs)                   # (C,H,W) complex
-    ref_2d_t  = ksp_2d_t * mask_t.unsqueeze(0)    # (C,H,W) masked
+    ksp_2d_t  = _fft(coil_imgs)                   # (C,H,W) complex  [UNMASKED full k-space]
 
-    # MVUE for logging (uses get_mvue/sp.ifft — not used in _sample after Fix 2)
+    # Fix 4: kspace_vol_norm normalization (mirror reconstruct_modified.py BraTS branch).
+    # ||target||_F == ||K_full||_F by Parseval (centered ortho FFT). Scale BOTH the masked
+    # observation and the GT by sqrt(prod(image_shape)) / ||target||, so the observation
+    # scale is acceleration-independent and Parseval-consistent. (The old per-volume
+    # sf = sqrt(H*W*2) / ||masked ref|| varied with the undersampling, putting the
+    # observation — and hence the prior balance — off-scale.)
+    gt_real         = torch.view_as_real(target_c.contiguous())   # (H,W,2) UNSCALED gt
+    kspace_vol_norm = gt_real.norm()
+    kspace_scale    = math.sqrt(float(gt_real.numel())) / kspace_vol_norm
+
+    ref_2d_t  = ksp_2d_t * mask_t.unsqueeze(0) * kspace_scale   # (C,H,W) masked + scaled
+    gt_2d     = gt_real * kspace_scale                          # (H,W,2) scaled to match
+
+    # MVUE from the SCALED masked k-space (kept in the same coordinate system)
     mvue_np = get_mvue(ref_2d_t.cpu().numpy()[np.newaxis], maps_2d[np.newaxis])
     mvue_t  = torch.from_numpy(mvue_np).to(device)  # (1,H,W) complex
 
     ref    = ref_2d_t.unsqueeze(0)   # (1,C,H,W) complex
     maps_b = maps_t.unsqueeze(0)     # (1,C,H,W) complex
     mask_b = mask_t.unsqueeze(0)     # (1,H,W) float
-    gt_2d  = torch.view_as_real(target_c.contiguous())  # (H,W,2) float
     return ref, mvue_t, maps_b, mask_b, gt_2d
 
 
@@ -439,8 +502,16 @@ def main():
                         help="Base Langevin step size.")
     parser.add_argument("--mse",          type=float, default=5.0,
                         help="DC weight λ on the meas-grad direction.")
+    parser.add_argument("--n_jumps",      type=int,   default=None,
+                        help="If set, use LangevinOptimizerStrided with this many "
+                             "uniformly-spaced timesteps (the 'multi_step' sampler). "
+                             "If omitted, use the standard LangevinOptimizer ('t1').")
     parser.add_argument("--prior_scaling_factor", type=float, default=1.0,
                         help="prior_trafo.scaling_factor (1.0 = no amplitude change).")
+    parser.add_argument("--prior_input_scale", type=float, default=None,
+                        help="Override for the score-model input scale (Fix 3). If "
+                             "omitted, computed from train_cfg as before (currently "
+                             "via a path that resolves to 1.0 — see CLAUDE.md gotcha #15).")
     args = parser.parse_args()
     device = args.device
 
@@ -460,12 +531,27 @@ def main():
     # Fix 3: load the training dataset scale so the score model receives
     # inputs at its training distribution O(target_scaling_factor).
     # This is distinct from prior_scaling_factor (the trafo's own amplitude scale).
-    _tcfg = OmegaConf.load(args.train_cfg)
-    prior_input_scale = float(
-        OmegaConf.select(_tcfg, "dataset.target_scaling_factor", default=1.0)
-    )
-    logging.info(f"prior_input_scale (train_cfg.dataset.target_scaling_factor) "
-                 f"= {prior_input_scale}")
+    if args.prior_input_scale is not None:
+        prior_input_scale = float(args.prior_input_scale)
+        logging.info(f"prior_input_scale = {prior_input_scale}  (CLI override)")
+    else:
+        # The training target scale lives at problem_trafos.dataset_trafo.target_scaling_factor
+        # (2.0 for 3axis_downsample, 5050.0 for the old bs4 model) — NOT under the top-level
+        # `dataset:` block (which holds only name/paths/readout_axes). The previous path
+        # "dataset.target_scaling_factor" resolved to that wrong block, so OmegaConf.select
+        # silently returned default=1.0 → the score model was fed inputs target_scaling_factor×
+        # too small and the prior went inert. Read the real path and FAIL LOUD on a miss so it
+        # can never silently fall back to 1.0 again.
+        _tcfg = OmegaConf.load(args.train_cfg)
+        _path = "problem_trafos.dataset_trafo.target_scaling_factor"
+        _val  = OmegaConf.select(_tcfg, _path, default=None)
+        if _val is None:
+            raise ValueError(
+                f"Could not resolve '{_path}' in {args.train_cfg}. "
+                f"Pass --prior_input_scale explicitly; do NOT let it silently default to 1.0."
+            )
+        prior_input_scale = float(_val)
+        logging.info(f"prior_input_scale ({_path}) = {prior_input_scale}")
 
     # ---- Volume loop --------------------------------------------------------
     n_total     = count_brats_volumes(args.lmdb)
@@ -474,6 +560,7 @@ def main():
 
     fbp_psnrs, rec_psnrs = [], []
     fbp_ssims, rec_ssims = [], []
+    rec_nmses = []
 
     for i in tqdm(range(num_volumes), desc="volumes"):
         vol_idx = args.vol_start + i
@@ -483,9 +570,10 @@ def main():
 
         H, W = ref.shape[-2], ref.shape[-1]
 
-        # Scale ref to unit-ish coordinate system (same formula as kno.py)
-        ref_real_norm  = torch.view_as_real(ref.squeeze(0)).norm().item()
-        scaling_factor = math.sqrt(float(H * W * 2)) / ref_real_norm
+        # Fix 4: kspace_vol_norm scaling is already baked into ref/mvue/gt_2d inside
+        # brats_vol_to_csgm_2d (Parseval-consistent, acceleration-independent), so there
+        # is no further per-volume rescale here — mirror reconstruct_modified.py BraTS path.
+        scaling_factor = 1.0
 
         ref_sf  = ref  * scaling_factor
         mvue_sf = mvue * scaling_factor
@@ -521,10 +609,17 @@ def main():
             "step_lr":      args.step_lr,
             "mse":          args.mse,
         }
-        optim = LangevinOptimizer(
-            config, device, score, sde, prior_trafo,
-            scaling_factor, prior_input_scale=prior_input_scale
-        ).to(device)
+        if args.n_jumps is not None:
+            config["n_jumps"] = args.n_jumps
+            optim = LangevinOptimizerStrided(
+                config, device, score, sde, prior_trafo,
+                scaling_factor, prior_input_scale=prior_input_scale
+            ).to(device)
+        else:
+            optim = LangevinOptimizer(
+                config, device, score, sde, prior_trafo,
+                scaling_factor, prior_input_scale=prior_input_scale
+            ).to(device)
 
         samples = optim.sample((ref_sf, mvue_sf, maps, mask_b))   # (1,2,H,W) at sf scale
 
@@ -533,13 +628,17 @@ def main():
         rec_2d    = (rec_sf_2d / scaling_factor).cpu()                 # (H,W,2) at gt
         rec_p     = kno_psnr(rec_2d, gt_2d.cpu())
         rec_s     = kno_ssim(rec_2d, gt_2d.cpu())
+        rec_n     = kno_nmse(rec_2d, gt_2d.cpu())
         rec_psnrs.append(rec_p.item()); rec_ssims.append(rec_s.item())
-        logging.info(f"[vol {vol_idx}] CSGM PSNR={rec_p:.2f} dB  SSIM={rec_s:.4f}")
+        rec_nmses.append(rec_n.item())
+        logging.info(f"[vol {vol_idx}] CSGM PSNR={rec_p:.2f} dB  SSIM={rec_s:.4f}  NMSE={rec_n:.6f}")
         wandb.log({
             "rec_psnr":      rec_p.item(),
             "rec_ssim":      rec_s.item(),
+            "rec_nmse":      rec_n.item(),
             "rec_psnr_mean": float(np.mean(rec_psnrs)),
             "rec_ssim_mean": float(np.mean(rec_ssims)),
+            "rec_nmse_mean": float(np.mean(rec_nmses)),
             "global_step":   i,
         })
 
@@ -549,6 +648,7 @@ def main():
         f"  FBP  SSIM: {np.mean(fbp_ssims):.4f} ± {np.std(fbp_ssims):.4f}\n"
         f"  CSGM PSNR: {np.mean(rec_psnrs):.2f} ± {np.std(rec_psnrs):.2f} dB\n"
         f"  CSGM SSIM: {np.mean(rec_ssims):.4f} ± {np.std(rec_ssims):.4f}\n"
+        f"  CSGM NMSE: {np.mean(rec_nmses):.6f} ± {np.std(rec_nmses):.6f}\n"
         f"{'='*60}"
     )
 
@@ -557,6 +657,7 @@ def main():
         wandb.run.summary["fbp_ssim_mean"] = float(np.mean(fbp_ssims))
         wandb.run.summary["rec_psnr_mean"] = float(np.mean(rec_psnrs))
         wandb.run.summary["rec_ssim_mean"] = float(np.mean(rec_ssims))
+        wandb.run.summary["rec_nmse_mean"] = float(np.mean(rec_nmses))
 
     wandb.finish()
 

@@ -16,3 +16,8 @@ training-runs/
 *log*
 ncsnv2-mri-mvue/*
 outputs
+
+# Binary recon/figure outputs (kept local, not version-controlled)
+*.png
+*.npy
+*.gif
