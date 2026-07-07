@@ -21,3 +21,10 @@ outputs
 *.png
 *.npy
 *.gif
+
+# Scratch launch/legacy/scrape/sweep/viz scripts (local-only)
+csgm_brats_qr.sh
+reconstruct_csgm_brats_LEGACYFFT.py
+scrape_brats_recon_v2_metrics.py
+sweep_csgm_brats.py
+visualize_brats_recon_vs_gt.py
