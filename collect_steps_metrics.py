@@ -64,8 +64,10 @@ def main():
     rows = {}
     for res in RES_LABEL:
         for arm in ARMS:
-            # newest log for this combination
-            cands = sorted(logdir.glob(f"csgm_{res}_{arm}_*.out"),
+            # newest log for this combination. The recon script logs via `logging`,
+            # which writes to stderr, so the metrics are in the .err file (.out holds
+            # only the sbatch header).
+            cands = sorted(logdir.glob(f"csgm_{res}_{arm}_*.err"),
                            key=lambda p: p.stat().st_mtime)
             if cands:
                 r = parse(cands[-1])
