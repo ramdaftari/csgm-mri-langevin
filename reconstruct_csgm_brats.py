@@ -57,6 +57,7 @@ import json
 import math
 import logging
 import argparse
+import functools
 from pathlib import Path
 
 import lmdb
@@ -276,6 +277,10 @@ class LangevinOptimizer(torch.nn.Module):
         with torch.no_grad():
             abar = sde._compute_alpha_cumprod(
                 torch.tensor(self.timesteps, device=device)).squeeze()
+            # t_start=0 leaves a single timestep, which .squeeze() collapses to 0-dim;
+            # sigmas[-1] below would then IndexError. Same guard as LangevinOptimizerStrided.
+            if abar.dim() == 0:
+                abar = abar.unsqueeze(0)
             self.sigmas = (1.0 - abar).sqrt().detach()
         # FIX (per reconstruct_csgm_skmtea.py "critical bug, now fixed"): divide by
         # sigmas[-1] (SMALLEST sigma, t≈0) not sigmas[0] (largest) — gives step
@@ -454,10 +459,9 @@ def _lmdb_read(env, vk, shape, dtype=np.complex64):
     return np.frombuffer(buf, dtype=dtype).reshape(shape).copy()
 
 
-def load_brats_volume(lmdb_path, vol_idx):
-    """Load one BraTS val volume. Returns (kspace, maps, target, mask) all complex64.
-    target is (X,Y,Z) — leading channel dim stripped. mask is (1,X,Y,Z)."""
-    lmdb_path = Path(lmdb_path)
+@functools.lru_cache(maxsize=1)
+def _load_brats_volume_uncached(lmdb_path_str, vol_idx):
+    lmdb_path = Path(lmdb_path_str)
     vk = str(vol_idx)
     env_shapes = _open_lmdb(lmdb_path / "shapes")
     with env_shapes.begin() as txn:
@@ -467,6 +471,19 @@ def load_brats_volume(lmdb_path, vol_idx):
     target = _lmdb_read(_open_lmdb(lmdb_path / "target"), vk, tuple(shp["target"]))
     mask   = _lmdb_read(_open_lmdb(lmdb_path / "masks"),  vk, tuple(shp["mask"]))
     return kspace, maps, target[0], mask   # target[0]: strip leading dim → (X,Y,Z)
+
+
+def load_brats_volume(lmdb_path, vol_idx):
+    """Load one BraTS val volume. Returns (kspace, maps, target, mask) all complex64.
+    target is (X,Y,Z) — leading channel dim stripped. mask is (1,X,Y,Z).
+
+    Cached on the current volume only (maxsize=1). --all_slices calls this once per
+    readout slice, so re-reading the whole volume every time dominates runtime — at
+    240x240x155 8-coil that is ~1.3 GB per slice, 240x per volume. Callers only read
+    the arrays (np.take copies, .real is a view), so sharing them across slices is safe.
+    Keying on str() keeps Path and str call sites on the same cache entry.
+    """
+    return _load_brats_volume_uncached(str(lmdb_path), int(vol_idx))
 
 
 def count_brats_volumes(lmdb_path):
