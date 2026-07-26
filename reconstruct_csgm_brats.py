@@ -15,11 +15,17 @@ Built from reconstruct_csgm_skmtea.py (SKM-TEA version) by changing ONLY:
      with swap_channels=True, scaling_factor=1.0 — same net effect as SKM-TEA
      move_axis=[-1,1] but with no amplitude scaling).
 
-Everything else is byte-for-byte reconstruct_csgm_skmtea.py:
-  - annealed Langevin loop, normalize/unnormalize, per-step gradient direction
-    normalization, Langevin update
+Shares with reconstruct_csgm_skmtea.py:
+  - annealed Langevin loop, per-step gradient direction normalization, Langevin update
   - DDPM schedule, KNO-project PSNR/SSIM metrics
-  - sf scaling: sqrt(H*W*2) / ||ref||
+
+Normalization (training-faithful, differs from the SKM-TEA quantile scheme):
+  Each slice is scaled by the WHOLE-VOLUME factor sqrt(prod(vol_shape)) / ||target_3D||_F
+  in brats_vol_to_csgm_2d (mirrors brats_slice_dataset + reconstruct_modified.py), so ref/gt
+  live in the score model's training GT domain. There is NO 99th-percentile MVUE
+  normalize/unnormalize (that was a leftover from the original NCSNv2 port and pushed the
+  score input off its training basis). _predict_eps then multiplies by prior_input_scale (2.0)
+  right before the score, reproducing the exact training input target_slice·sqrt(prod)/||·||·2.0.
 
 Key scaling-factor note (score-model input scale = prior_input_scale, Fix 3):
   The current prior is the 3axis_downsample model (EMA_CKPT below), trained with
@@ -35,10 +41,11 @@ Key scaling-factor note (score-model input scale = prior_input_scale, Fix 3):
   old 5050 constant, are superseded (see EMA_CKPT comment). CLAUDE.md gotchas
   #14/#15 describe that old 5050 CSGM path.
 
-Three fixes vs the original broken version:
+Key fixes vs the original broken version:
   Fix 1: ref recomputed via _fft(target_2d) — stored kspace had 1D-IFFT artifact.
-  Fix 2: MVUE via _ifft (ortho) not sp.ifft (backward) — consistent with _fft ref.
-  Fix 3: prior_in * prior_input_scale in _predict_eps — score model training scale.
+  Fix 3: samples * prior_input_scale in _predict_eps — score model training scale.
+  (An earlier MVUE-normalization fix is obsolete: the 99th-pctile MVUE normalize/unnormalize
+   was removed with the volume-RMS normalization change, so MVUE is no longer computed.)
 
 Run from baselines/resolution_robust_3d_mri/ with .venv active:
     python ../csgm-mri-langevin/reconstruct_csgm_brats.py --num_volumes 1 --no_wandb
@@ -162,16 +169,6 @@ def get_mvue(kspace_np, smaps_np):
     )
 
 
-def normalize(gen_img, estimated_mvue):
-    scaling = torch.quantile(estimated_mvue.abs(), 0.99)
-    return gen_img * scaling
-
-
-def unnormalize(gen_img, estimated_mvue):
-    scaling = torch.quantile(estimated_mvue.abs(), 0.99)
-    return gen_img / scaling
-
-
 # ===========================================================================
 # KNO metrics — same as reconstruct_csgm_skmtea.py.
 # ===========================================================================
@@ -247,8 +244,8 @@ def load_prior_trafo(train_cfg_path, scaling_factor=1.0):
 
 # ===========================================================================
 # LangevinOptimizer — BraTS variant.
-# Fix 2: MVUE computed via _ifft (consistent with _fft-built ref).
-# Fix 3: prior_in scaled by prior_input_scale before score model (training scale).
+# samples are fed to the score at their training scale (× prior_input_scale) in _predict_eps;
+# ref/gt are pre-scaled to the volume-RMS training domain in brats_vol_to_csgm_2d.
 # ===========================================================================
 class LangevinOptimizer(torch.nn.Module):
     def __init__(self, config, device, score, sde, prior_trafo, scaling_factor,
@@ -261,6 +258,18 @@ class LangevinOptimizer(torch.nn.Module):
         self.prior_trafo       = prior_trafo
         self.scaling_factor    = scaling_factor
         self.prior_input_scale = prior_input_scale  # Fix 3: match training distribution scale
+
+        # Per-DDPM-level tracking (opt-in). When track=True, after each noise level
+        # we record (t, sigma, step_size, psnr, ssim, nmse, |p_grad|, |meas_grad_raw|,
+        # |meas_grad_used|, |p_grad-meas_grad|, err) into self.trace. gt_2d is the
+        # volume-RMS-scaled (H,W,2) GT slice on `device` (metrics are scale-invariant).
+        self.track = bool(config.get("track", False))
+        self.gt_2d = config.get("gt_2d", None)
+        self.trace = []
+
+        # Ablation: --no_prior drops the prior's directional term from the Langevin
+        # update ONLY. Default 1.0 → self.prior_scale*p_grad is byte-identical to p_grad.
+        self.prior_scale = 0.0 if config.get("no_prior", False) else 1.0
 
         t_start = min(int(config["t_start"]), sde.num_steps - 1)
         self.timesteps = list(range(t_start, -1, -1))
@@ -276,23 +285,20 @@ class LangevinOptimizer(torch.nn.Module):
 
     @torch.no_grad()
     def _predict_eps(self, samples_b2hw, t_idx):
-        x_hw2    = samples_b2hw.permute(0, 2, 3, 1).contiguous()
-        prior_in = self.prior_trafo(x_hw2)
-        t_vec    = torch.full((samples_b2hw.shape[0],), t_idx,
-                              device=self.device, dtype=torch.long)
-        # Fix 3: scale to match score model training distribution O(target_scaling_factor)
-        eps_prior = self.score(prior_in * self.prior_input_scale, t_vec)
-        eps_hw2   = self.prior_trafo.trafo_inv(eps_prior)
-        return eps_hw2.permute(0, 3, 1, 2).contiguous()
+        # The BraTS prior_trafo is a pure channel-swap (swap_channels=True, no crop/
+        # magnitude/scale), so the old permute→prior_trafo→...→trafo_inv→permute round-trip
+        # was an identity. Just feed the score at its training distribution scale (×2.0).
+        t_vec = torch.full((samples_b2hw.shape[0],), t_idx,
+                           device=self.device, dtype=torch.long)
+        return self.score(samples_b2hw * self.prior_input_scale, t_vec)
 
     def _sample(self, y):
         ref, mvue, maps, batch_mri_mask = y
 
-        # Fix 2: MVUE via _ifft (ortho norm) — ref was built with _fft (ortho norm).
-        # sp.ifft uses backward norm (÷H×W) → would underestimate scaling by sqrt(H×W).
-        coil_imgs      = _ifft(ref)
-        denom          = (maps.abs().pow(2).sum(1, keepdim=True) + 1e-8).sqrt()
-        estimated_mvue = (coil_imgs * maps.conj()).sum(1) / denom.squeeze(1)
+        # ref/gt already live in the training GT domain (volume-RMS scaled in
+        # brats_vol_to_csgm_2d), so samples stay in that same domain — no quantile
+        # normalize/unnormalize. coil_imgs is the adjoint k-space, reused for the zf init.
+        coil_imgs = _ifft(ref)
 
         logging.info(f"Running {len(self.timesteps)} DDPM timesteps × "
                      f"{self.config['n_steps_each']} inner Langevin steps "
@@ -307,10 +313,8 @@ class LangevinOptimizer(torch.nn.Module):
         H, W = self.config["image_size"]
         if self.config.get("init_mode", "random") == "zf":
             # Adjoint-SENSE ZF reconstruction — same as SenseModel.backward() in the 3D project.
-            # coil_imgs = _ifft(ref) is already in memory from the MVUE computation above.
             zf_complex = (coil_imgs * maps.conj()).sum(dim=1)                          # (B,H,W) complex
-            zf_real    = torch.view_as_real(zf_complex.contiguous()).permute(0, 3, 1, 2)  # (B,2,H,W)
-            samples    = unnormalize(zf_real, estimated_mvue)  # put in prior domain (÷ scaling)
+            samples    = torch.view_as_real(zf_complex.contiguous()).permute(0, 3, 1, 2)  # (B,2,H,W)
         else:
             samples = torch.rand(B, 2, H, W, device=self.device)
 
@@ -326,23 +330,29 @@ class LangevinOptimizer(torch.nn.Module):
                 # give 3 for brain anatomy). No dynamic split needed.
                 n_steps_each = int(self.config["n_steps_each"])
 
+                # Gradient-norm snapshot from the LAST inner Langevin step of this level.
+                pgrad = dgrad_raw = dgrad_used = total_grad = float("nan")
                 for _ in range(n_steps_each):
                     noise  = torch.randn_like(samples) * math.sqrt(step_size * 2)
                     eps    = self._predict_eps(samples, t_idx)
                     p_grad = -eps / (sigma + 1e-8)
 
-                    meas      = forward_operator(normalize(samples, estimated_mvue))
+                    meas      = forward_operator(samples)
                     meas_grad = torch.view_as_real(
                         torch.sum(_ifft(meas - ref) * torch.conj(maps), axis=1)
                     ).permute(0, 3, 1, 2)
-                    meas_grad = unnormalize(meas_grad, estimated_mvue)
                     meas_grad = meas_grad.type(torch.cuda.FloatTensor) \
                                 if samples.is_cuda else meas_grad.float()
+                    dgrad_raw = float(torch.norm(meas_grad))   # DC gradient A^H(Ax-ref), pre-renorm
                     meas_grad /= torch.norm(meas_grad)
                     meas_grad *= torch.norm(p_grad)
                     meas_grad *= self.config["mse"]
 
-                    samples = samples + step_size * (p_grad - meas_grad) + noise
+                    samples = samples + step_size * (self.prior_scale * p_grad - meas_grad) + noise
+
+                    pgrad      = float(torch.norm(p_grad))                 # prior/score gradient
+                    dgrad_used = float(torch.norm(meas_grad))              # DC gradient used (= mse*|p_grad|)
+                    total_grad = float(torch.norm(p_grad - meas_grad))     # net negative-loss drift
 
                     err = (meas - ref).norm()
                     metrics = [t_idx, step_size, err.item(),
@@ -354,9 +364,34 @@ class LangevinOptimizer(torch.nn.Module):
 
                     if torch.isnan(err):
                         logging.warning(f"NaN at t={t_idx} — early stop.")
-                        return normalize(samples, estimated_mvue)
+                        if self.track:
+                            self._record_level(t_idx, sigma, step_size, samples,
+                                                pgrad, dgrad_raw, dgrad_used, total_grad,
+                                                float(err))
+                        return samples
 
-        return normalize(samples, estimated_mvue)
+                if self.track:
+                    self._record_level(t_idx, sigma, step_size, samples,
+                                        pgrad, dgrad_raw, dgrad_used, total_grad,
+                                        float(err))
+
+        return samples
+
+    # Column order for self.trace rows / saved npz (see main() TRACE_COLS).
+    def _record_level(self, t_idx, sigma, step_size, samples,
+                      pgrad, dgrad_raw, dgrad_used, total_grad, err):
+        """Append one per-DDPM-level record. Metrics compare the running iterate
+        (volume-RMS domain) to gt_2d; PSNR/SSIM/NMSE are scale-invariant."""
+        rec_hw2 = samples.squeeze(0).permute(1, 2, 0)  # (H,W,2), on device
+        if self.gt_2d is not None:
+            psnr = float(kno_psnr(rec_hw2, self.gt_2d))
+            ssim = float(kno_ssim(rec_hw2, self.gt_2d))
+            nmse = float(kno_nmse(rec_hw2, self.gt_2d))
+        else:
+            psnr = ssim = nmse = float("nan")
+        self.trace.append((int(t_idx), float(sigma), float(step_size),
+                           psnr, ssim, nmse,
+                           pgrad, dgrad_raw, dgrad_used, total_grad, err))
 
     def sample(self, y):
         return self._sample(y)
@@ -368,7 +403,7 @@ class LangevinOptimizer(torch.nn.Module):
 # ONLY override is __init__ (replaces the dense [t_start..0] timestep list with
 # n_jumps uniformly spaced timesteps and recomputes sigmas/sigma_min). _sample/
 # _predict_eps/sample are inherited UNCHANGED, so all BraTS-specific behavior
-# (2D mask orientation='2d', prior_input_scale Fix 3, MVUE via _ifft, metrics)
+# (2D mask orientation='2d', prior_input_scale, volume-RMS scaling, metrics)
 # carries over automatically.
 # ===========================================================================
 class LangevinOptimizerStrided(LangevinOptimizer):
@@ -443,7 +478,7 @@ def count_brats_volumes(lmdb_path):
 # ===========================================================================
 # Per-volume preprocessing — BraTS LMDB → CSGM-shaped tensors.
 #   ref:   (1, C, H, W) complex   masked k-space (Fix 1: via _fft from target)
-#   mvue:  (1, H, W) complex      for logging (not used inside _sample)
+#   mvue:  None                   (obsolete; kept for tuple/call-site stability)
 #   maps:  (1, C, H, W) complex   sensitivity maps
 #   mask:  (1, H, W) float        2D phase-encode mask
 #   gt_2d: (H, W, 2) float        ground-truth target at gt scale
@@ -468,27 +503,42 @@ def brats_vol_to_csgm_2d(lmdb_path, vol_idx, device, readout_axis=0, slice_idx=N
     coil_imgs = target_c.unsqueeze(0) * maps_t    # (C,H,W) complex  [broadcast target]
     ksp_2d_t  = _fft(coil_imgs)                   # (C,H,W) complex  [UNMASKED full k-space]
 
-    # Fix 4: kspace_vol_norm normalization (mirror reconstruct_modified.py BraTS branch).
-    # ||target||_F == ||K_full||_F by Parseval (centered ortho FFT). Scale BOTH the masked
-    # observation and the GT by sqrt(prod(image_shape)) / ||target||, so the observation
-    # scale is acceleration-independent and Parseval-consistent. (The old per-volume
-    # sf = sqrt(H*W*2) / ||masked ref|| varied with the undersampling, putting the
-    # observation — and hence the prior balance — off-scale.)
-    gt_real         = torch.view_as_real(target_c.contiguous())   # (H,W,2) UNSCALED gt
-    kspace_vol_norm = gt_real.norm().item()   # Python float — avoids device mismatch when dividing cpu tensors later
-    kspace_scale    = math.sqrt(float(gt_real.numel())) / max(kspace_vol_norm, 1e-8)
+    # Training-faithful normalization (mirror brats_slice_dataset + reconstruct_modified.py):
+    # scale every slice by the WHOLE-VOLUME factor sqrt(prod(vol_shape)) / ||target_3D||_F,
+    # NOT a per-slice norm. Training fed the model `target_slice * sqrt(prod(target_vol_shape))
+    # / ||target_3D||_F * target_scaling_factor`; a per-slice RMS-1 norm would flatten the
+    # inter-slice brightness the model learned and push the score input off its training basis.
+    # Use the magnitude-image element count (no ×2) and the volume norm so the ×2.0 applied in
+    # _predict_eps reproduces the exact training input scale. Parseval keeps ref consistent:
+    # ref = A(gt_2d) after both are scaled by the same kspace_scale.
+    gt_real      = torch.view_as_real(target_c.contiguous())   # (H,W,2) UNSCALED gt slice
+    vol_norm     = float(np.linalg.norm(target.real))          # ||target_3D||_F (whole volume)
+    kspace_scale = math.sqrt(float(target.size)) / max(vol_norm, 1e-8)
 
     ref_2d_t  = ksp_2d_t * mask_t.unsqueeze(0) * kspace_scale   # (C,H,W) masked + scaled
     gt_2d     = gt_real * kspace_scale                          # (H,W,2) scaled to match
 
-    # MVUE from the SCALED masked k-space (kept in the same coordinate system)
-    mvue_np = get_mvue(ref_2d_t.cpu().numpy()[np.newaxis], maps_2d[np.newaxis])
-    mvue_t  = torch.from_numpy(mvue_np).to(device)  # (1,H,W) complex
+    # MVUE is no longer consumed by _sample (the quantile normalize/unnormalize that used it
+    # was removed). Skip the per-slice sigpy FFT — it also did 0/0 → NaN on background slices.
+    # Kept in the return tuple as None for call-site/signature stability.
+    mvue_t = None
 
     ref    = ref_2d_t.unsqueeze(0)   # (1,C,H,W) complex
     maps_b = maps_t.unsqueeze(0)     # (1,C,H,W) complex
     mask_b = mask_t.unsqueeze(0)     # (1,H,W) float
     return ref, mvue_t, maps_b, mask_b, gt_2d, kspace_scale
+
+
+def _save_trace_npz(save_dir, vol_idx, vol_trace, cols):
+    """Atomically (re)write the consolidated per-slice trace npz. Called after every
+    slice so a manually-stopped / interrupted run keeps all completed slices."""
+    out = {"columns": np.array(cols)}
+    for s_key, arr in vol_trace.items():
+        out[f"slice_{s_key}"] = arr
+    tmp   = os.path.join(save_dir, f"vol{vol_idx}_trace.tmp.npz")   # ends in .npz → no auto-append
+    final = os.path.join(save_dir, f"vol{vol_idx}_trace.npz")
+    np.savez_compressed(tmp, **out)
+    os.replace(tmp, final)
 
 
 # ===========================================================================
@@ -522,11 +572,13 @@ def main():
                              "uniformly-spaced timesteps (the 'multi_step' sampler). "
                              "If omitted, use the standard LangevinOptimizer ('t1').")
     parser.add_argument("--prior_scaling_factor", type=float, default=1.0,
-                        help="prior_trafo.scaling_factor (1.0 = no amplitude change).")
+                        help="INERT for BraTS: _predict_eps no longer routes through prior_trafo, "
+                             "so this has no effect (must stay 1.0). The score-model amplitude is "
+                             "set by --prior_input_scale instead. Passing !=1.0 fails loud.")
     parser.add_argument("--prior_input_scale", type=float, default=None,
-                        help="Override for the score-model input scale (Fix 3). If "
-                             "omitted, computed from train_cfg as before (currently "
-                             "via a path that resolves to 1.0 — see CLAUDE.md gotcha #15).")
+                        help="Override for the score-model input scale. If omitted, resolved from "
+                             "train_cfg problem_trafos.dataset_trafo.target_scaling_factor (=2.0 for "
+                             "the 3axis prior); fails loud if that key is missing. See CLAUDE.md #15.")
     parser.add_argument("--init_mode", type=str, default="zf",
                         choices=["random", "zf"],
                         help="'zf': initialize from zero-filled SENSE reconstruction (default). "
@@ -535,8 +587,28 @@ def main():
                         help="Reconstruct ALL readout slices per volume and report 3D "
                              "volume PSNR/SSIM/NMSE (comparable to KNO/diffusion tables). "
                              "~60× slower than the default mid-slice mode.")
+    parser.add_argument("--save_dir", type=str, default=None,
+                        help="If set, save per-volume GT/recon/FBP magnitude volumes (.npy) "
+                             "and the per-slice/per-DDPM-level metric trace (.npz) here.")
+    parser.add_argument("--track", action="store_true",
+                        help="Record per-DDPM-level psnr/ssim/nmse + gradient norms "
+                             "(pgrad, dgrad_raw, dgrad_used, total) for every slice. "
+                             "Written to --save_dir; wandb gets per-slice + volume summaries.")
+    parser.add_argument("--no_prior", action="store_true",
+                        help="Ablation: drop the diffusion-prior term (p_grad) from the "
+                             "Langevin update (data-consistency + noise only). Everything else "
+                             "identical. Default OFF → recon is byte-identical to the paper run.")
     args = parser.parse_args()
     device = args.device
+
+    # prior_trafo is no longer consumed by _predict_eps, so --prior_scaling_factor is inert.
+    # Fail loud instead of silently ignoring a non-default value (would be a no-op footgun).
+    if args.prior_scaling_factor != 1.0:
+        raise ValueError(
+            "--prior_scaling_factor is inert for BraTS (prior amplitude is handled by "
+            "--prior_input_scale); leave it at 1.0. Got "
+            f"{args.prior_scaling_factor}."
+        )
 
     wandb.init(
         project=os.environ.get("WANDB_PROJECT", "brats_csgm"),
@@ -585,6 +657,13 @@ def main():
     fbp_ssims, rec_ssims = [], []
     rec_nmses = []
 
+    # Per-slice/per-DDPM-level trace columns (see LangevinOptimizer._record_level).
+    TRACE_COLS = ["t", "sigma", "step_size", "psnr", "ssim", "nmse",
+                  "pgrad", "dgrad_raw", "dgrad_used", "total", "err"]
+    if args.save_dir is not None:
+        os.makedirs(args.save_dir, exist_ok=True)
+        logging.info(f"Saving GT/recon/FBP volumes + per-slice traces to {args.save_dir}")
+
     for i in tqdm(range(num_volumes), desc="volumes"):
         vol_idx = args.vol_start + i
 
@@ -600,6 +679,7 @@ def main():
             slices_iter = [None]   # None → mid-slice in brats_vol_to_csgm_2d
 
         rec_mags, fbp_mags = [], []   # (H,W) magnitude tensors, unscaled — filled for all_slices
+        vol_trace = {}                # slice_idx (or -1 for mid) → (n_levels, len(TRACE_COLS)) array
 
         for s_idx in tqdm(slices_iter, desc="slices", leave=False, disable=not args.all_slices):
             ref, mvue, maps, mask_b, gt_2d, kspace_scale = brats_vol_to_csgm_2d(
@@ -607,9 +687,13 @@ def main():
             )
             H, W = ref.shape[-2], ref.shape[-1]
 
-            # Skip background slices (kspace_scale huge → target≈0 → all NaN).
-            # For 3D assembly we push zeros; for mid-slice this never triggers (mid has tissue).
-            if args.all_slices and not torch.isfinite(ref).all():
+            # Skip fully-background readout slices (target≈0). Reconstructing one only injects
+            # Langevin noise, and its zero DC residual makes `meas_grad /= ||meas_grad||` == 0/0
+            # = NaN, which would poison the whole assembled volume's 3D metrics. Zero-fill instead.
+            # (Detect via gt content: the old `isfinite(ref)` check relied on the per-slice norm
+            # blowing kspace_scale to inf, but kspace_scale is now a finite volume constant, so
+            # ref stays finite on background slices and that guard never fired.)
+            if args.all_slices and float(gt_2d.abs().max()) < 1e-8:
                 fbp_mags.append(torch.zeros(H, W)); rec_mags.append(torch.zeros(H, W))
                 continue
 
@@ -635,25 +719,37 @@ def main():
                 "step_lr":      args.step_lr,
                 "mse":          args.mse,
                 "init_mode":    args.init_mode,
+                "track":        args.track,
+                "gt_2d":        gt_2d.to(device),
+                "no_prior":     args.no_prior,
             }
             if args.n_jumps is not None:
                 config["n_jumps"] = args.n_jumps
-                optim = LangevinOptimizerStrided(
-                    config, device, score, sde, prior_trafo,
-                    1.0, prior_input_scale=prior_input_scale
-                ).to(device)
+                Cls = LangevinOptimizerStrided
             else:
-                optim = LangevinOptimizer(
-                    config, device, score, sde, prior_trafo,
-                    1.0, prior_input_scale=prior_input_scale
-                ).to(device)
+                Cls = LangevinOptimizer
+            optim = Cls(config, device, score, sde, prior_trafo,
+                        1.0, prior_input_scale=prior_input_scale).to(device)
 
             samples   = optim.sample((ref, mvue, maps, mask_b))         # (1,2,H,W)
             rec_sf_2d = samples.squeeze(0).permute(1, 2, 0).contiguous()  # (H,W,2)
 
+            # ---- collect per-slice trace + per-slice wandb summary --------------
+            if args.track and len(optim.trace):
+                key = s_idx if s_idx is not None else -1
+                vol_trace[key] = np.asarray(optim.trace, dtype=np.float32)
+                if args.save_dir is not None:
+                    _save_trace_npz(args.save_dir, vol_idx, vol_trace, TRACE_COLS)  # incremental
+                final = optim.trace[-1]   # last DDPM level = converged slice metrics
+                wandb.log({"slice_idx":  float(key),
+                           "slice_psnr": final[3], "slice_ssim": final[4],
+                           "slice_nmse": final[5], "slice_pgrad": final[6],
+                           "slice_dgrad_raw": final[7], "slice_dgrad_used": final[8],
+                           "slice_total_grad": final[9]})
+
             if args.all_slices:
                 # Unscale to original [0,1] target domain for 3D assembly.
-                # kspace_scale = sqrt(H*W*2) / ||target_2d||_F (per-slice); dividing undoes it.
+                # kspace_scale = sqrt(prod(vol_shape)) / ||target_3D||_F (volume constant); dividing undoes it.
                 fbp_mags.append((_to_mag(fbp_sf_2d.cpu()) / kspace_scale))  # (H,W)
                 rec_mags.append((_to_mag(rec_sf_2d.cpu()) / kspace_scale))  # (H,W)
             else:
@@ -678,11 +774,21 @@ def main():
                            "rec_nmse_mean": float(np.mean(rec_nmses)),
                            "global_step": i})
 
+                if args.save_dir is not None:
+                    # mid-slice 2D magnitudes (symmetric with the all_slices save below)
+                    np.save(os.path.join(args.save_dir, f"vol{vol_idx}_gt2d.npy"),
+                            _to_mag(gt_2d.cpu()).numpy())
+                    np.save(os.path.join(args.save_dir, f"vol{vol_idx}_recon2d.npy"),
+                            _to_mag(rec_sf_2d.cpu()).numpy())
+                    np.save(os.path.join(args.save_dir, f"vol{vol_idx}_fbp2d.npy"),
+                            _to_mag(fbp_sf_2d.cpu()).numpy())
+
         if args.all_slices:
-            # Assemble 3D volume (X,Y,Z) and compute 3D metrics comparable to KNO/diffusion tables.
-            # rec_mags / fbp_mags are per-slice (H,W) tensors along readout_axis=0 → stack on dim 0.
-            rec_3d = torch.stack(rec_mags, dim=0).unsqueeze(0).unsqueeze(0)  # (1,1,X,H,W)
-            fbp_3d = torch.stack(fbp_mags, dim=0).unsqueeze(0).unsqueeze(0)  # (1,1,X,H,W)
+            # Assemble 3D volume and compute 3D metrics comparable to KNO/diffusion tables.
+            # Per-slice (H,W) mags are the two non-readout axes, so stack them back along
+            # readout_axis to recover (X,Y,Z) aligned with gt_3d (works for any readout_axis).
+            rec_3d = torch.stack(rec_mags, dim=args.readout_axis).unsqueeze(0).unsqueeze(0)  # (1,1,X,Y,Z)
+            fbp_3d = torch.stack(fbp_mags, dim=args.readout_axis).unsqueeze(0).unsqueeze(0)  # (1,1,X,Y,Z)
             gt_3d  = target_3d.abs().unsqueeze(0).unsqueeze(0)               # (1,1,X,Y,Z)
 
             fbp_p = _meddlr_metrics.psnr(fbp_3d, gt_3d).mean()
@@ -704,6 +810,21 @@ def main():
                        "rec_ssim_mean": float(np.mean(rec_ssims)),
                        "rec_nmse_mean": float(np.mean(rec_nmses)),
                        "global_step": i})
+
+            if args.save_dir is not None:
+                np.save(os.path.join(args.save_dir, f"vol{vol_idx}_gt.npy"),
+                        gt_3d.squeeze().cpu().numpy())
+                np.save(os.path.join(args.save_dir, f"vol{vol_idx}_recon.npy"),
+                        rec_3d.squeeze().cpu().numpy())
+                np.save(os.path.join(args.save_dir, f"vol{vol_idx}_fbp.npy"),
+                        fbp_3d.squeeze().cpu().numpy())
+                logging.info(f"[vol {vol_idx}] saved gt/recon/fbp volumes to {args.save_dir}")
+
+        # ---- final trace consolidation (already written incrementally per slice) --
+        if args.track and args.save_dir is not None and vol_trace:
+            _save_trace_npz(args.save_dir, vol_idx, vol_trace, TRACE_COLS)
+            logging.info(f"[vol {vol_idx}] saved trace for {len(vol_trace)} slices; "
+                         f"columns={TRACE_COLS}")
 
     logging.info(
         f"\n{'='*60}\n"
