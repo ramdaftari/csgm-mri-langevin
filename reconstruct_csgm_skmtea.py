@@ -53,8 +53,35 @@ from tqdm import tqdm
 # Path setup: KNO venv first (for torchmetrics 0.11.4 needed by meddlr),
 # KNO src last (for datasets.skmtea, src.fastmri).
 # ---------------------------------------------------------------------------
-KNO_SRC  = Path(__file__).resolve().parents[2]
-KNO_VENV = Path(__file__).resolve().parents[3] / ".venv/lib/python3.10/site-packages"
+def _find_kno_root(start: Path) -> Path:
+    """Walk up to the mri3d root (the dir holding src/datasets/skmtea.py).
+
+    Replaces a fixed `parents[2]`/`parents[3]` depth, which silently resolves to the
+    wrong directory whenever this file is run from anywhere other than
+    <mri3d>/src/ram/csgm-mri-langevin/ — e.g. from a git worktree, where it picked up
+    `.claude/` as KNO_SRC and then failed with `ModuleNotFoundError: meddlr`.
+    Resolution is identical to the old code at the canonical location.
+    """
+    for p in start.parents:
+        if (p / "src" / "datasets" / "skmtea.py").exists():
+            return p
+    return start.parents[3]
+
+
+_KNO_ROOT = _find_kno_root(Path(__file__).resolve())
+KNO_SRC  = _KNO_ROOT / "src"
+KNO_VENV = _KNO_ROOT / ".venv/lib/python3.10/site-packages"
+
+# `import src.diffmodels` (res_rob) cannot be relied on via the venv's editable
+# install: that .pth points at src/baselines/resolution_robust_3d_mri/src, which does
+# not exist — the real tree is under src/ram/. This is a PRE-EXISTING breakage (the
+# script could not `import src` before these changes either), so resolve res_rob
+# explicitly from whichever location actually holds it.
+for _rr_cand in (_KNO_ROOT / "src/ram/resolution_robust_3d_mri",
+                 _KNO_ROOT / "src/baselines/resolution_robust_3d_mri"):
+    if (_rr_cand / "src" / "diffmodels").is_dir():
+        sys.path.insert(0, str(_rr_cand))
+        break
 sys.path.insert(0, str(KNO_VENV))
 sys.path.append(str(KNO_SRC))
 
@@ -165,13 +192,23 @@ def get_mvue(kspace_np, smaps_np):
     )
 
 
+def _q99_per_sample(estimated_mvue):
+    """Per-sample 99th percentile of |mvue|, as a (B,) tensor.
+
+    Must be per sample once slices are batched: a global quantile over a (B,X,Y)
+    stack would let one slice's intensity set another slice's normalization.
+    At B=1 this is exactly the original `torch.quantile(estimated_mvue.abs(), 0.99)`.
+    """
+    return torch.quantile(estimated_mvue.abs().flatten(1), 0.99, dim=1)
+
+
 def normalize(gen_img, estimated_mvue):
-    scaling = torch.quantile(estimated_mvue.abs(), 0.99)
+    scaling = _q99_per_sample(estimated_mvue).view(-1, *([1] * (gen_img.dim() - 1)))
     return gen_img * scaling
 
 
 def unnormalize(gen_img, estimated_mvue):
-    scaling = torch.quantile(estimated_mvue.abs(), 0.99)
+    scaling = _q99_per_sample(estimated_mvue).view(-1, *([1] * (gen_img.dim() - 1)))
     return gen_img / scaling
 
 
@@ -191,6 +228,18 @@ def _to_mag(t):
     return torch.view_as_complex(t.contiguous()).abs() if t.shape[-1] == 2 else t.abs()
 
 
+def _bnorm(t):
+    """Per-sample L2 norm of a (B, ...) tensor, shaped (B,1,..,1) for broadcasting.
+
+    Slice batching requires the Langevin gradient renormalization to be PER SAMPLE:
+    a global `torch.norm(t)` reduces over the batch dim too, which would make each
+    slice's data-consistency step depend on the slices stacked beside it.
+    For B=1 this returns exactly `torch.norm(t)`, so --slice_batch 1 (the default)
+    stays byte-identical to the original per-slice code path.
+    """
+    return t.flatten(1).norm(dim=1).view(-1, *([1] * (t.dim() - 1)))
+
+
 def kno_psnr(rec_xy2, gt_xy2):
     """rec, gt: (X, Y, 2). Returns scalar KNO PSNR (dB)."""
     rec_mag = _to_mag(rec_xy2).unsqueeze(0).unsqueeze(0)
@@ -202,6 +251,28 @@ def kno_ssim(rec_xy2, gt_xy2):
     rec_mag = _to_mag(rec_xy2).unsqueeze(0).unsqueeze(0)
     gt_mag  = _to_mag(gt_xy2).unsqueeze(0).unsqueeze(0)
     return _meddlr_metrics.ssim(rec_mag, gt_mag).mean()
+
+
+def kno_nmse(rec_xy2, gt_xy2):
+    """fastmri/evaluate.py convention: ||gt-pred||^2 / ||gt||^2 on magnitudes."""
+    rec_mag = _to_mag(rec_xy2)
+    gt_mag  = _to_mag(gt_xy2)
+    return (rec_mag - gt_mag).pow(2).sum() / gt_mag.pow(2).sum()
+
+
+def volume_metrics(rec_3d_mag, gt_3d_mag):
+    """3D volume PSNR/SSIM/NMSE, comparable to the KIR-NO / res_rob tables.
+
+    Both inputs are (X, Y, Z) magnitude tensors. meddlr selects its 3D SSIM kernel
+    from the tensor rank, so the (1,1,X,Y,Z) shaping here is what makes this a true
+    3D SSIM rather than the 2D one used by the mid-slice path.
+    """
+    rec = rec_3d_mag.unsqueeze(0).unsqueeze(0)
+    gt  = gt_3d_mag.unsqueeze(0).unsqueeze(0)
+    psnr = _meddlr_metrics.psnr(rec, gt).mean()
+    ssim = _meddlr_metrics.ssim(rec, gt).mean()
+    nmse = (rec - gt).pow(2).sum() / gt.pow(2).sum()
+    return psnr, ssim, nmse
 
 
 # ===========================================================================
@@ -290,7 +361,7 @@ class LangevinOptimizer(torch.nn.Module):
         )
         # In our sf-scaling framework, normalize(x) = x * Q99(|mvue|) must be ~identity
         # so that A(normalize(x_gt)) ≈ ref at the true solution. Divide out Q99 so it → 1.
-        _q99 = torch.quantile(estimated_mvue.abs(), 0.99).clamp(min=1e-6)
+        _q99 = _q99_per_sample(estimated_mvue).clamp(min=1e-6).view(-1, 1, 1)
         estimated_mvue = estimated_mvue / _q99
         logging.info(f"Running {len(self.timesteps)} DDPM timesteps × "
                      f"{self.config['n_steps_each']} inner Langevin steps "
@@ -303,7 +374,18 @@ class LangevinOptimizer(torch.nn.Module):
         B = ref.shape[0]
         H, W = self.config["image_size"]
 
-        samples = torch.rand(B, 2, H, W, device=self.device)         # CSGM init (uniform [0,1])
+        if self.config.get("init_mode", "random") == "zf":
+            # Adjoint-SENSE zero-filled init (as reconstruct_csgm_brats.py does).
+            # With a short --n_jumps budget the chain cannot travel far from its
+            # starting point, so a uniform-noise init leaves the reconstruction far
+            # below zero-filling; starting AT zero-filling makes few-step numbers
+            # meaningful. Default stays "random" = original CSGM behavior.
+            zf_complex = (_ifft(ref) * maps.conj()).sum(dim=1)        # (B, H, W) complex
+            samples = torch.view_as_real(
+                zf_complex.contiguous()
+            ).permute(0, 3, 1, 2).float().contiguous()                # (B, 2, H, W)
+        else:
+            samples = torch.rand(B, 2, H, W, device=self.device)     # CSGM init (uniform [0,1])
 
         step_lr = float(self.config["step_lr"])
         pbar    = tqdm(self.timesteps, desc="anneal", leave=False)
@@ -330,9 +412,13 @@ class LangevinOptimizer(torch.nn.Module):
                     meas_grad  = unnormalize(meas_grad, estimated_mvue)
                     meas_grad  = meas_grad.type(torch.cuda.FloatTensor) \
                                 if samples.is_cuda else meas_grad.float()
-                    meas_grad /= torch.norm(meas_grad)
-                    meas_grad *= torch.norm(p_grad)
-                    meas_grad *= self.config["mse"]
+                    # PER-SAMPLE norms (_bnorm): with --slice_batch > 1 a global
+                    # torch.norm would reduce over the batch dim too, making each
+                    # slice's DC step depend on the slices stacked beside it.
+                    # At B=1, _bnorm(t) == torch.norm(t), so this is byte-identical.
+                    meas_grad = meas_grad / _bnorm(meas_grad).clamp(min=1e-12)
+                    meas_grad = meas_grad * _bnorm(p_grad)
+                    meas_grad = meas_grad * self.config["mse"]
 
                     # CSGM Langevin update
                     samples = samples + step_size * (p_grad - meas_grad) + noise
@@ -526,6 +612,77 @@ def lmdb_volume_to_csgm_2d(batch, device, z_slice=-1):
 
 
 # ===========================================================================
+# Whole-volume prep + batched Z-slice gather (used by --all_slices).
+#
+# Mirrors reconstruct_csgm_brats.py's all-slices design, with one SKM-TEA-specific
+# difference: the hybrid 1D-IFFT along Z is a (C,X,Y,Z) transform, so it is done
+# ONCE per volume here instead of once per slice (lmdb_volume_to_csgm_2d recomputes
+# it every call, which would dominate runtime over 160-320 slices).
+# ===========================================================================
+def prepare_volume(batch, accel):
+    """One-time per-volume prep shared by every slice batch.
+
+    Returns a dict with the hybrid k-space and a VOLUME-CONSTANT scaling factor.
+    The scale must be constant across slices: the single-slice path derives it from
+    that slice's own k-space norm, but doing that per slice would give each slice a
+    different magnitude scale and corrupt the assembled 3D volume. Using the
+    root-mean-square per-slice norm (||full|| / sqrt(Z)) reproduces the single-slice
+    formula for a typical slice while staying constant over z.
+    """
+    kspace = batch.kspace.squeeze(0)        # (C, X, Y, Z) complex64
+    maps   = batch.maps.squeeze(0)          # (C, X, Y, Z)
+    target = batch.target.squeeze(0)        # (1, X, Y, Z)
+    mask   = batch.mask.squeeze(0)          # (1, X, Y, Z)
+
+    # KNO mask bug correction: m*(1+j)*k → m*k   (same as the single-slice path)
+    kspace_clean = kspace * torch.tensor((1 - 1j) / 2, dtype=torch.complex64)
+
+    ksp_z_hybrid = torch_fft.fftshift(
+        torch_fft.ifft(
+            torch_fft.ifftshift(kspace_clean, dim=-1),
+            dim=-1, norm="ortho",
+        ),
+        dim=-1,
+    )                                                         # (C, X, Y, Z)
+
+    C, X, Y, Z = ksp_z_hybrid.shape
+    vol_norm  = torch.view_as_real(ksp_z_hybrid).norm().item()
+    rms_slice = vol_norm / math.sqrt(Z)                       # typical per-slice norm
+    raw_sf    = math.sqrt(float(X * Y * 2)) / max(rms_slice, 1e-12)
+    scaling_factor = raw_sf * (2.0 / math.sqrt(float(accel)))
+
+    return {
+        "ksp": ksp_z_hybrid, "maps": maps, "target": target, "mask": mask,
+        "Z": Z, "X": X, "Y": Y, "scaling_factor": scaling_factor,
+    }
+
+
+def slice_batch_from_prep(prep, device, z_indices):
+    """Gather a batch of Z-slices as CSGM-shaped tensors.
+
+    ref/maps: (B, C, X, Y) complex,  mask: (B, Y) float,  gt: (B, X, Y, 2).
+    For a single index this is identical to lmdb_volume_to_csgm_2d's output.
+    """
+    zs = torch.as_tensor(list(z_indices), dtype=torch.long)
+
+    ref    = prep["ksp"][:, :, :, zs].permute(3, 0, 1, 2).contiguous().to(device)
+    maps_b = prep["maps"][:, :, :, zs].permute(3, 0, 1, 2).contiguous().to(device)
+    gt_b   = torch.view_as_real(
+        prep["target"].squeeze(0)[:, :, zs].permute(2, 0, 1).contiguous().to(device)
+    )                                                          # (B, X, Y, 2)
+    # Phase-encode mask is constant along X → take one X-row per slice.
+    mask_b = prep["mask"].real[0, 0, :, zs].permute(1, 0).contiguous().to(device).float()
+
+    # MVUE is diagnostic only (the optimizer recomputes it from ref via get_mvue),
+    # but keep it correct and batched for parity with the single-slice path.
+    mvue_b = torch.from_numpy(
+        get_mvue(ref.cpu().numpy(), maps_b.cpu().numpy())
+    ).to(device)                                               # (B, X, Y) complex
+
+    return ref, mvue_b, maps_b, mask_b, gt_b
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 def main():
@@ -565,6 +722,21 @@ def main():
                         help="If set, use LangevinOptimizerStrided with n_jumps uniformly spaced "
                              "noise levels instead of all t_start+1 levels. "
                              "E.g., --n_jumps 11 with t_start=299, n_steps_each=5 → 55 total steps.")
+    parser.add_argument("--init_mode",    type=str, default="random",
+                        choices=["random", "zf"],
+                        help="Langevin init. 'random' (default) = uniform [0,1), the "
+                             "original CSGM behavior. 'zf' = adjoint-SENSE zero-filled "
+                             "init, which is what makes short --n_jumps budgets "
+                             "meaningful (reconstruct_csgm_brats.py defaults to zf).")
+    parser.add_argument("--all_slices",   action="store_true",
+                        help="Reconstruct ALL Z-slices per volume, assemble the 3D "
+                             "volume and report 3D PSNR/SSIM/NMSE (comparable to the "
+                             "KIR-NO / res_rob tables). Default off = mid-slice 2D "
+                             "metrics, which are NOT comparable. LMDB mode only.")
+    parser.add_argument("--slice_batch",  type=int,   default=1,
+                        help="Number of Z-slices reconstructed per Langevin run when "
+                             "--all_slices is set. >1 batches slices on the GPU. "
+                             "Default 1 is byte-identical to serial per-slice.")
     parser.add_argument("--z_slice",      type=int,   default=-1,
                         help="Z-slice index to reconstruct (-1 = middle).")
     args = parser.parse_args()
@@ -610,6 +782,128 @@ def main():
         volume_iter = (
             (0, h5_to_csgm_2d(H5_PATH, device)),
         )
+
+    # =======================================================================
+    # --all_slices: reconstruct every Z-slice, assemble the 3D volume, and report
+    # 3D PSNR/SSIM/NMSE — the same protocol reconstruct_csgm_brats.py uses, so the
+    # numbers are comparable to the KIR-NO / res_rob tables (the default mid-slice
+    # path below reports 2D metrics, which are NOT comparable).
+    # Slices are reconstructed in GPU batches of --slice_batch.
+    # =======================================================================
+    if args.all_slices:
+        if not use_lmdb:
+            raise SystemExit("--all_slices requires LMDB mode (the H5 fallback is single-slice).")
+
+        _R = _DATASET_ACCEL.get(args.dataset, 4)
+        vol_rows = []
+        loader_all = DataLoader(dataset, batch_size=1, shuffle=False)
+
+        for i, batch in enumerate(
+            tqdm(islice(loader_all, args.vol_start, args.vol_start + num_volumes),
+                 total=num_volumes, desc="volumes")
+        ):
+            vol_idx = args.vol_start + i
+            prep = prepare_volume(batch, _R)
+            sf, Z = prep["scaling_factor"], prep["Z"]
+            zs = list(range(Z))
+            chunks = [zs[j:j + args.slice_batch]
+                      for j in range(0, len(zs), args.slice_batch)]
+
+            rec_by_z, fbp_by_z = {}, {}
+
+            for chunk in tqdm(chunks, desc="slice-batches", leave=False):
+                ref, mvue, maps_b, mask_b, gt_b = slice_batch_from_prep(prep, device, chunk)
+                X, Y = ref.shape[-2], ref.shape[-1]
+
+                # Zero-fill fully-background slices instead of reconstructing them:
+                # their zero DC residual makes meas_grad/||meas_grad|| = 0/0 = NaN, which
+                # would poison the assembled volume's 3D metrics. Filtered OUT of the
+                # batch so one empty slice cannot NaN the others beside it.
+                keep = [b for b in range(len(chunk)) if float(gt_b[b].abs().max()) >= 1e-8]
+                for b in range(len(chunk)):
+                    if b not in keep:
+                        fbp_by_z[chunk[b]] = torch.zeros(X, Y)
+                        rec_by_z[chunk[b]] = torch.zeros(X, Y)
+                if not keep:
+                    continue
+                if len(keep) < len(chunk):
+                    sel = torch.as_tensor(keep, device=ref.device)
+                    ref, mvue, maps_b, mask_b, gt_b = (
+                        ref[sel], mvue[sel], maps_b[sel], mask_b[sel], gt_b[sel])
+                keys = [chunk[b] for b in keep]
+
+                ref_sf, mvue_sf = ref * sf, mvue * sf
+
+                if i == 0 and keys[0] == 0:
+                    logging.info(
+                        f"[vol {vol_idx}] all_slices Z={Z} batch={len(keys)} "
+                        f"ref={tuple(ref.shape)} maps={tuple(maps_b.shape)} "
+                        f"mask={tuple(mask_b.shape)} gt={tuple(gt_b.shape)} sf={sf:.6f}")
+
+                with torch.no_grad():
+                    coils_img = _ifft(ref_sf)                                 # (B,C,X,Y)
+                    fbp_xy    = (torch.conj(maps_b) * coils_img).sum(dim=1)   # (B,X,Y)
+                    fbp_sf_b  = torch.view_as_real(fbp_xy.contiguous())       # (B,X,Y,2)
+
+                config = {
+                    "device":       device,
+                    "image_size":   (X, Y),
+                    "orientation":  args.orientation,
+                    "t_start":      args.t_start,
+                    "n_steps_each": args.n_steps_each,
+                    "step_lr":      args.step_lr,
+                    "mse":          args.mse,
+                    "init_mode":    args.init_mode,
+                }
+                if args.n_jumps is not None:
+                    config["n_jumps"] = args.n_jumps
+                    Cls = LangevinOptimizerStrided
+                else:
+                    Cls = LangevinOptimizer
+                optim = Cls(config, device, score, sde, prior_trafo, sf).to(device)
+
+                samples  = optim.sample((ref_sf, mvue_sf, maps_b, mask_b))    # (B,2,X,Y)
+                rec_sf_b = samples.permute(0, 2, 3, 1).contiguous()           # (B,X,Y,2)
+
+                for bi, k in enumerate(keys):
+                    fbp_by_z[k] = _to_mag(fbp_sf_b[bi].cpu()) / sf
+                    rec_by_z[k] = _to_mag(rec_sf_b[bi].cpu()) / sf
+
+            # ---- assemble 3D volume and score it ---------------------------
+            rec_3d = torch.stack([rec_by_z[z] for z in zs], dim=-1)   # (X,Y,Z)
+            fbp_3d = torch.stack([fbp_by_z[z] for z in zs], dim=-1)
+            gt_3d  = prep["target"].squeeze(0).abs().cpu()            # (X,Y,Z)
+
+            fp, fs, fn = volume_metrics(fbp_3d, gt_3d)
+            rp, rs, rn = volume_metrics(rec_3d, gt_3d)
+
+            logging.info(f"[vol {vol_idx}] 3D FBP  PSNR={fp:.2f} dB  SSIM={fs:.4f}  NMSE={fn:.6f}")
+            logging.info(f"[vol {vol_idx}] 3D CSGM PSNR={rp:.2f} dB  SSIM={rs:.4f}  NMSE={rn:.6f}")
+            wandb.log({"vol_fbp_psnr_3d": fp.item(), "vol_fbp_ssim_3d": fs.item(),
+                       "vol_rec_psnr_3d": rp.item(), "vol_rec_ssim_3d": rs.item(),
+                       "vol_rec_nmse_3d": rn.item(), "global_step": i})
+
+            vol_rows.append({"vol_idx": vol_idx,
+                             "fbp_psnr": fp.item(), "fbp_ssim": fs.item(), "fbp_nmse": fn.item(),
+                             "rec_psnr": rp.item(), "rec_ssim": rs.item(), "rec_nmse": rn.item()})
+
+        if vol_rows:
+            def _m(k):
+                return float(np.mean([r[k] for r in vol_rows]))
+            logging.info("=" * 72)
+            logging.info(f"3D VOLUME METRICS over n={len(vol_rows)} volumes "
+                         f"({args.dataset}, slice_batch={args.slice_batch}, "
+                         f"n_jumps={args.n_jumps})")
+            logging.info(f"  FBP   PSNR={_m('fbp_psnr'):.2f}  SSIM={_m('fbp_ssim'):.4f}  "
+                         f"NMSE={_m('fbp_nmse'):.6f}")
+            logging.info(f"  CSGM  PSNR={_m('rec_psnr'):.2f}  SSIM={_m('rec_ssim'):.4f}  "
+                         f"NMSE={_m('rec_nmse'):.6f}")
+            logging.info("=" * 72)
+        if args.out_json:
+            with open(args.out_json, "w") as _f:
+                json.dump(vol_rows, _f, indent=2)
+            logging.info(f"wrote {args.out_json}")
+        return
 
     fbp_psnrs, rec_psnrs = [], []
     fbp_ssims, rec_ssims = [], []
@@ -665,6 +959,7 @@ def main():
             "n_steps_each": args.n_steps_each,
             "step_lr":      args.step_lr,
             "mse":          args.mse,
+                    "init_mode":    args.init_mode,
         }
         if args.n_jumps is not None:
             config["n_jumps"] = args.n_jumps
