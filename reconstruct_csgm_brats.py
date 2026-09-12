@@ -195,7 +195,7 @@ def kno_psnr(rec_hw2, gt_hw2):
 def kno_ssim(rec_hw2, gt_hw2):
     rec_mag = _to_mag(rec_hw2).unsqueeze(0).unsqueeze(0)
     gt_mag  = _to_mag(gt_hw2).unsqueeze(0).unsqueeze(0)
-    return _meddlr_metrics.ssim(rec_mag, gt_mag).mean()
+    return _meddlr_metrics.ssim(rec_mag, gt_mag, method="wang").mean()
 
 
 def kno_nmse(rec_hw2, gt_hw2):
@@ -792,9 +792,9 @@ def main():
             gt_3d  = target_3d.abs().unsqueeze(0).unsqueeze(0)               # (1,1,X,Y,Z)
 
             fbp_p = _meddlr_metrics.psnr(fbp_3d, gt_3d).mean()
-            fbp_s = _meddlr_metrics.ssim(fbp_3d, gt_3d).mean()
+            fbp_s = _meddlr_metrics.ssim(fbp_3d, gt_3d, method="wang").mean()
             rec_p = _meddlr_metrics.psnr(rec_3d, gt_3d).mean()
-            rec_s = _meddlr_metrics.ssim(rec_3d, gt_3d).mean()
+            rec_s = _meddlr_metrics.ssim(rec_3d, gt_3d, method="wang").mean()
             rec_n = ((rec_3d - gt_3d).pow(2).sum() / gt_3d.pow(2).sum())
 
             fbp_psnrs.append(fbp_p.item()); fbp_ssims.append(fbp_s.item())

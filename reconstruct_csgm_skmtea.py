@@ -230,7 +230,7 @@ def kno_psnr(rec_hw2, gt_hw2):
 def kno_ssim(rec_hw2, gt_hw2):
     rec_mag = _to_mag(rec_hw2).unsqueeze(0).unsqueeze(0)
     gt_mag  = _to_mag(gt_hw2).unsqueeze(0).unsqueeze(0)
-    return _meddlr_metrics.ssim(rec_mag, gt_mag).mean()
+    return _meddlr_metrics.ssim(rec_mag, gt_mag, method="wang").mean()
 
 
 def kno_nmse(rec_hw2, gt_hw2):
@@ -252,7 +252,7 @@ def volume_metrics(rec_3d_mag, gt_3d_mag):
     rec = rec_3d_mag.unsqueeze(0).unsqueeze(0)
     gt  = gt_3d_mag.unsqueeze(0).unsqueeze(0)
     psnr = _meddlr_metrics.psnr(rec, gt).mean()
-    ssim = _meddlr_metrics.ssim(rec, gt).mean()
+    ssim = _meddlr_metrics.ssim(rec, gt, method="wang").mean()
     nmse = (rec - gt).pow(2).sum() / gt.pow(2).sum()
     return psnr, ssim, nmse
 
