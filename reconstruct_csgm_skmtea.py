@@ -534,8 +534,26 @@ def _centered_mask(mask_3d):
 #   gt_b:  (B, H, W, 2) float     ground-truth slices, volume-norm scaled
 # H, W = (Y, Z) since readout_axis=0 (X).
 # ===========================================================================
+def load_obs_pt(path):
+    """Load a precomputed observation: kspace (C,X,Y,Z), maps (C,X,Y,Z), target (X,Y,Z), mask (X,Y,Z).
+
+    kspace is already masked and on the same norm as target. Returns (maps, target, mask, hybrid)
+    as numpy, where hybrid is kspace inverse-FFT'd along the readout axis X, so each readout
+    slice of it is that slice's measured 2D k-space.
+    """
+    obs = torch.load(path, map_location="cpu", weights_only=False)
+    k = obs["kspace"].to(torch.complex64)
+    hybrid = torch.fft.fftshift(
+        torch.fft.ifft(torch.fft.ifftshift(k, dim=1), dim=1, norm="ortho"), dim=1)
+    target = obs["target"].to(torch.complex64).reshape(obs["maps"].shape[1:])
+    mask = obs["mask"].real if obs["mask"].is_complex() else obs["mask"]
+    mask = mask.float().reshape(obs["maps"].shape[1:])
+    return (obs["maps"].to(torch.complex64).numpy(), target.numpy(),
+            mask.numpy().astype(np.complex64), hybrid.numpy())
+
+
 def skmtea_vol_to_csgm_2d_batch(vol, device, readout_axis, slice_indices):
-    maps, target, mask_c, kspace_scale = vol
+    maps, target, mask_c, kspace_scale, hybrid = vol
     idx = [(target.shape[readout_axis] // 2 if s is None else int(s))
            for s in slice_indices]
     sel = np.asarray(idx)
@@ -552,8 +570,12 @@ def skmtea_vol_to_csgm_2d_batch(vol, device, readout_axis, slice_indices):
     mask_t   = torch.from_numpy(np.ascontiguousarray(mask_2d)).to(device)
     mask_t   = mask_t.unsqueeze(0).expand(target_t.shape[0], -1, -1).contiguous()
 
-    coil_imgs = target_t.unsqueeze(1) * maps_t                  # (B,C,H,W) complex
-    ksp_b     = _fft(coil_imgs)                                 # UNMASKED 2D k-space
+    if hybrid is None:
+        coil_imgs = target_t.unsqueeze(1) * maps_t              # (B,C,H,W) complex
+        ksp_b     = _fft(coil_imgs)                             # UNMASKED 2D k-space
+    else:
+        ksp_b = torch.from_numpy(np.ascontiguousarray(
+            np.moveaxis(np.take(hybrid, sel, axis=ax_cxyz), ax_cxyz, 0))).to(device)
 
     ref    = ksp_b * mask_t.unsqueeze(1) * kspace_scale         # (B,C,H,W)
     gt_b   = torch.view_as_real(target_t.contiguous()) * kspace_scale   # (B,H,W,2)
@@ -621,6 +643,10 @@ def main():
     parser.add_argument("--no_prior", action="store_true",
                         help="Ablation: drop the diffusion-prior term (p_grad) from the "
                              "Langevin update (data consistency + noise only).")
+    parser.add_argument("--obs_pt", type=str, default=None,
+                        help="Reconstruct one precomputed observation (.pt with kspace, maps, "
+                             "target, mask) instead of LMDB volumes; ref is taken from its "
+                             "k-space, not recomputed from target.")
     args = parser.parse_args()
     device = args.device
 
@@ -631,7 +657,7 @@ def main():
         )
 
     lmdb_path = Path(args.lmdb) if args.lmdb else SKMTEA_LMDBS[args.dataset]
-    if not (lmdb_path / "shapes").is_dir():
+    if args.obs_pt is None and not (lmdb_path / "shapes").is_dir():
         raise FileNotFoundError(
             f"SKM-TEA LMDB not found: {lmdb_path} (missing 'shapes' sub-db). "
             f"Known sets: {[str(v) for v in SKMTEA_LMDBS.values()]}"
@@ -669,13 +695,17 @@ def main():
         logging.info(f"prior_input_scale ({_path}) = {prior_input_scale}")
 
     # ---- Volume loop --------------------------------------------------------
-    keys = _volume_keys(lmdb_path)
-    n_total = len(keys)
-    remaining = n_total - args.vol_start
-    num_volumes = remaining if args.num_volumes in (None, -1) \
-        else min(args.num_volumes, remaining)
-    logging.info(f"SKM-TEA LMDB: {n_total} volumes at {lmdb_path}  "
-                 f"({num_volumes} to process from index {args.vol_start})")
+    if args.obs_pt:
+        keys, args.vol_start, num_volumes = [Path(args.obs_pt).stem], 0, 1
+        logging.info(f"Observation file: {args.obs_pt}")
+    else:
+        keys = _volume_keys(lmdb_path)
+        n_total = len(keys)
+        remaining = n_total - args.vol_start
+        num_volumes = remaining if args.num_volumes in (None, -1) \
+            else min(args.num_volumes, remaining)
+        logging.info(f"SKM-TEA LMDB: {n_total} volumes at {lmdb_path}  "
+                     f"({num_volumes} to process from index {args.vol_start})")
 
     fbp_psnrs, rec_psnrs = [], []
     fbp_ssims, rec_ssims = [], []
@@ -688,7 +718,11 @@ def main():
 
     for i in tqdm(range(num_volumes), desc="volumes"):
         vol_key = keys[args.vol_start + i]
-        maps, target, mask_raw = load_skmtea_volume(lmdb_path, vol_key)
+        if args.obs_pt:
+            maps, target, mask_raw, hybrid = load_obs_pt(args.obs_pt)
+        else:
+            maps, target, mask_raw = load_skmtea_volume(lmdb_path, vol_key)
+            hybrid = None
         mask_c, was_centered = _centered_mask(mask_raw)
 
         # Training-faithful, mask-independent volume scaling (see module docstring):
@@ -699,7 +733,7 @@ def main():
         target_t3 = torch.from_numpy(target)
         vol_norm  = float(torch.view_as_real(target_t3).norm())
         kspace_scale = math.sqrt(float(target.size)) / max(vol_norm, 1e-8)
-        vol = (maps, target, mask_c, kspace_scale)
+        vol = (maps, target, mask_c, kspace_scale, hybrid)
 
         if args.all_slices:
             slices_iter = list(range(target.shape[args.readout_axis]))
