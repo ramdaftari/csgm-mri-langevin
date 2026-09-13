@@ -321,6 +321,8 @@ class LangevinOptimizer(torch.nn.Module):
         with torch.no_grad():
             abar = sde._compute_alpha_cumprod(
                 torch.tensor(self.timesteps, device=device)).squeeze()
+            if abar.dim() == 0:
+                abar = abar.unsqueeze(0)
             self.sigmas = (1.0 - abar).sqrt().detach()
         # Divide by sigmas[-1] (the SMALLEST sigma, t~0), which plays the role of
         # sigma_L in Song & Ermon annealed Langevin: steps are LARGE at high noise
